@@ -90,6 +90,12 @@ configuration:
         description: Specify a hook that, if needed, can filter the raw list of work files found
                      for the current work area
 
+    hook_find_publishes:
+        type: hook
+        default_value: "{self}/find_publishes.py"
+        description: Specify a hook that, performs a query to get the latest publishes from 
+                     ShotGrid for the current Work area.
+
     hook_filter_publishes:
         type: hook
         default_value: "{self}/filter_publishes.py"

@@ -44,13 +44,19 @@ class SgPublishedFilesModel(ShotgunModel):
 
     uid = property(_get_uid, _set_uid)
 
-    def load_data(self, filters=None, fields=None):
+    def load_data(self, filters=None, fields=None, order=None, limit=None):
         """
         """
         filters = filters or []
         fields = fields or ["code"]
         hierarchy = [fields[0]]
-        return self._load_data(self._published_file_type, filters, hierarchy, fields)
+
+        data = self._load_data(
+            self._published_file_type, filters, hierarchy, fields,
+            order=order, limit=limit,
+        )
+
+        return data
 
     def refresh(self):
         """

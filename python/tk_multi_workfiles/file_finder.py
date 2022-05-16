@@ -32,6 +32,9 @@ BackgroundTaskManager = task_manager.BackgroundTaskManager
 from .work_area import WorkArea
 from .util import monitor_qobject_lifetime, Threaded
 
+import threading
+thread_cache = threading.local()
+thread_lock = threading.Lock()
 
 class FileFinder(QtCore.QObject):
     """
@@ -140,6 +143,11 @@ class FileFinder(QtCore.QObject):
         QtCore.QObject.__init__(self, parent)
         self._app = sgtk.platform.current_bundle()
 
+        if not hasattr(thread_cache, 'context_template_fields'):
+            thread_cache.context_template_fields = {}
+
+        self._memcache = thread_cache.context_template_fields
+
     ################################################################################################
 
     def find_files(
@@ -157,16 +165,12 @@ class FileFinder(QtCore.QObject):
         :returns:                   A list of FileItem instances, one for each unique version of a file found in either
                                     the work or publish areas
         """
+
+        self._app.log_info('Preparing Look up for work file paths...')
+
         # can't find anything without a work template!
         if not work_template:
             return []
-
-        # determien the publish filters to use from the context:
-        publish_filters = [["entity", "is", context.entity or context.project]]
-        if context.task:
-            publish_filters.append(["task", "is", context.task])
-        else:
-            publish_filters.append(["task", "is", None])
 
         # get the list of valid file extensions if set:
         valid_file_extensions = [
@@ -185,7 +189,8 @@ class FileFinder(QtCore.QObject):
         )
         filtered_work_files = self._filter_work_files(work_files, valid_file_extensions)
 
-        published_files = self._find_publishes(publish_filters)
+        # find and filter the publishes
+        published_files = self._find_publishes(context)
         filtered_published_files = self._filter_publishes(
             published_files, publish_template, valid_file_extensions
         )
@@ -259,6 +264,8 @@ class FileFinder(QtCore.QObject):
                   :class:`FileItem`.
         """
         files = {}
+
+        self._app.log_info('Start process work files')
 
         for work_file in work_files:
 
@@ -335,8 +342,38 @@ class FileFinder(QtCore.QObject):
                 "work_path": work_path,
                 "work_details": file_details,
             }
+            
+        self._app.log_info('End process work files')
 
         return files
+
+    def _retrieve_context_template_fields(self, context, template,validate=False):
+
+        thread_lock.acquire()
+        self._app.log_info(
+            (
+                'Context as template fields\n'
+                'Context: {0}\n'
+                'Templte:{1}'
+            ).format(context, template)
+        )
+        
+        start =  time.time()
+        if context in self._memcache:
+            if template in self._memcache[context]:
+                fields = self._memcache[context][template]
+            else:
+                fields = context.as_template_fields(template, validate=validate)
+                self._memcache[context][template] = fields
+        else:
+            fields = context.as_template_fields(template, validate=validate)
+            self._memcache[context] = {template: fields}
+
+        timing = time.time() - start
+        self._app.log_info('Resolved fields took: {0}s'.format(timing))
+        thread_lock.release()
+
+        return fields
 
     def _process_publish_files(
         self,
@@ -350,16 +387,23 @@ class FileFinder(QtCore.QObject):
     ):
         """
         """
+
+        self._app.log_info('Start process publish files')
+
         files = {}
 
         # and add in publish details:
-        ctx_fields = context.as_template_fields(work_template)
+        ctx_fields = self._retrieve_context_template_fields(
+            context, work_template
+        )
 
         for sg_publish in sg_publishes:
             file_details = {}
 
             # always have a path:
             publish_path = sg_publish["path"]
+
+            self._app.log_info('Process publish file: {0}'.format(publish_path))
 
             # determine the work path fields from the publish fields + ctx fields:
             # The order is important as it ensures that the user is correct if the
@@ -436,15 +480,26 @@ class FileFinder(QtCore.QObject):
                 "publish_path": publish_path,
                 "publish_details": file_details,
             }
+
+        self._app.log_info('End process publish files')
+
         return files
 
-    def _find_publishes(self, publish_filters):
+    def _find_publishes(self, context):
         """
         Find all publishes for the specified context and publish template
 
         :returns:                   List of dictionaries, each one containing the details
                                     of an individual published file
         """
+
+        # determien the publish filters to use from the context:
+        publish_filters = [["entity", "is", context.entity or context.project]]
+        if context.task:
+            publish_filters.append(["task", "is", context.task])
+        else:
+            publish_filters.append(["task", "is", None])
+
         fields = [
             "id",
             "description",
@@ -456,10 +511,36 @@ class FileFinder(QtCore.QObject):
             "path",
             "task",
         ]
-        published_file_type = sgtk.util.get_published_file_entity_type(self._app.sgtk)
-        sg_publishes = self._app.shotgun.find(
-            published_file_type, publish_filters, fields
+
+        published_file_type = sgtk.util.get_published_file_entity_type(
+            self._app.sgtk
         )
+
+        # execute the hook - this will return a list of ShotGrid filters:
+        find_query_options = self._app.execute_hook(
+            "hook_find_publishes", 
+            context=context, 
+            filters=publish_filters,
+            fields=fields
+        )
+
+        if not isinstance(find_query_options, dict):
+            self._app.log_error(
+                "hook_find_publishes returned an unexpected result type '%s' - ignoring!"
+                % type(find_query_options).__name__
+            )
+            find_query_options = None
+
+        if not find_query_options:
+            find_query_options = {
+                'filters': publish_filters,
+                'fields': fields
+            }
+
+        sg_publishes = self._app.shotgun.find(
+            published_file_type, **find_query_options
+        )
+
         return sg_publishes
 
     def _filter_publishes(self, sg_publishes, publish_template, valid_file_extensions):
@@ -540,10 +621,17 @@ class FileFinder(QtCore.QObject):
                                                 different versions of the same file
         :returns:                               A list of file paths.
         """
+
+        self._app.log_info(
+            'Resolving Work Template fields for: {0}'.format(work_template)
+        )
+
         # find work files that match the current work template:
         work_fields = []
         try:
-            work_fields = context.as_template_fields(work_template, validate=True)
+            work_fields = self._retrieve_context_template_fields(
+                context, work_template, validate=True
+            )
         except TankError as e:
             # could not resolve fields from this context. This typically happens
             # when the context object does not have any corresponding objects on
@@ -559,6 +647,7 @@ class FileFinder(QtCore.QObject):
         # Skip any keys from work_fields that are _only_ optional in the template.  This is to
         # ensure we find as wide a range of files as possible considering all optional keys.
         # Note, this may be better as a general change to the paths_from_template method...
+        self._app.log_info('Resolving fields to skip...')
         skip_fields += [n for n in work_fields if work_template.is_optional(n)]
 
         # Find all versions so skip the 'version' key if it's present and not
@@ -567,9 +656,11 @@ class FileFinder(QtCore.QObject):
             skip_fields += ["version"]
 
         # find paths:
+        self._app.log_info('Looking for work file paths...')
         work_file_paths = self._app.sgtk.paths_from_template(
             work_template, work_fields, skip_fields, skip_missing_optional_keys=True
         )
+        self._app.log_info('Foun {0} work file paths'.format(len(work_file_paths)))
         return work_file_paths
 
     def _filter_work_files(self, work_file_paths, valid_file_extensions):
@@ -582,6 +673,9 @@ class FileFinder(QtCore.QObject):
         :returns: A list of dictionaries for every filtered path, with details
                   about the filtered path.
         """
+
+        self._app.log_info('Filtering work file paths...')
+
         # Build list of work files to send to the filter_work_files hook.
         # TODO: the hook expects details in the dictionary but we are just
         # populationg the path value, so either the hook documentation should be
@@ -637,6 +731,8 @@ class FileFinder(QtCore.QObject):
                 file_details["editable_reason"] = editable_info.get("reason", "")
 
             work_files.append(file_details)
+
+        self._app.log_info('Work file paths filtering is done, result: {0}'.format(len(work_files)))
 
         return work_files
 
@@ -746,6 +842,8 @@ class AsyncFileFinder(FileFinder):
         """
         users = users or []
 
+        self._app.log_info('Begin search for entity {0} and users{1}'.format(entity, users))
+
         # get a new unique group id from the task manager - this will be used as the search id
         search_id = self._bg_task_manager.next_group_id()
 
@@ -753,9 +851,11 @@ class AsyncFileFinder(FileFinder):
         # models created will be the max number of searches at any one time.
         publish_model = None
         if self._available_publish_models:
+            self._app.log_info('Reusing publish model')
             # re-use an existing publish model:
             publish_model = self._available_publish_models.pop(0)
         else:
+            self._app.log_info('Creating a new publish model')
             # create a new model:
             publish_model = SgPublishedFilesModel(
                 search_id, self._bg_task_manager, parent=self
@@ -772,6 +872,7 @@ class AsyncFileFinder(FileFinder):
         self._searches[search.id] = search
 
         # begin the search stage 1:
+        self._app.log_info('Begining search stage 1')
         self._begin_search_stage_1(search)
 
         # and return the search id:
@@ -780,6 +881,9 @@ class AsyncFileFinder(FileFinder):
     def _begin_search_stage_1(self, search):
         """
         """
+
+        self._app.log_info('Start search stage 1')
+
         # start Stage 1 to construct the work area:
         # 1a. Construct a work area for the entity.  The work area contains the context as well as
         # all settings, etc. specific to the work area.
@@ -796,12 +900,19 @@ class AsyncFileFinder(FileFinder):
             upstream_task_ids=[search.construct_work_area_task],
         )
 
+        self._app.log_info('End search stage 1')
+
     def _begin_search_for_work_files(self, search, work_area):
         """
         """
 
+        self._app.log_info(
+            'Searching workfiles for users in work area: {0}'.format(work_area)
+        )
+
         # 2a. Add tasks to find and filter work files:
         for user in search.users:
+            self._app.log_info('Looking for work files for user: {0}'.format(user))
             user_id = user["id"] if user else None
 
             # create a copy of the work area for this user:
@@ -841,6 +952,9 @@ class AsyncFileFinder(FileFinder):
     def _begin_search_process_publishes(self, search, sg_publishes):
         """
         """
+
+        self._app.log_info('Start search process publishes')
+
         # 3a. Process publishes
         for user in search.users:
             user_id = user["id"] if user else None
@@ -871,6 +985,8 @@ class AsyncFileFinder(FileFinder):
             )
 
             search.find_publishes_tasks.add(process_publish_items_task)
+        
+        self._app.log_info('End search process publishes')
 
     def _on_publish_model_refreshed(self, data_changed):
         """
@@ -903,6 +1019,9 @@ class AsyncFileFinder(FileFinder):
 
         Runs in main thread
         """
+
+        self._app.log_info('Background Task completed...')
+
         if search_id not in self._searches:
             return
         search = self._searches[search_id]
@@ -1026,6 +1145,9 @@ class AsyncFileFinder(FileFinder):
     def _task_construct_work_area(self, entity, **kwargs):
         """
         """
+
+        self._app.log_info('Start construct work area')
+
         app = sgtk.platform.current_bundle()
         work_area = None
         if entity:
@@ -1035,19 +1157,27 @@ class AsyncFileFinder(FileFinder):
             # build the work area for this context: This may throw, but the background task manager framework
             # will catch
             work_area = WorkArea(context)
+
+        self._app.log_info('End construct work area')
+
         return {"environment": work_area}
 
     def _task_resolve_sandbox_users(self, environment, **kwargs):
         """
         """
+        self._app.log_info('Start resolve sandbox users')
         if environment:
             environment.resolve_user_sandboxes()
+        self._app.log_info('End resolve sandbox users')
         return {"environment": environment}
 
     def _load_cached_publishes(self, search, work_area):
         """
         Runs in main thread.
         """
+
+        self._app.log_info('Start load cached publishes')
+
         publish_filters = []
         # If there is no entity in the context then we are trying to load the publishes from the project.
         publish_filters.append(
@@ -1069,13 +1199,41 @@ class AsyncFileFinder(FileFinder):
             "task",
         ]
 
+        # execute the hook - this will return a list of ShotGrid filters:
+        find_query_options = self._app.execute_hook(
+            "hook_find_publishes", 
+            context=work_area.context, 
+            filters=publish_filters,
+            fields=fields
+        )
+
+        if not isinstance(find_query_options, dict):
+            self._app.log_error(
+                "hook_find_publishes returned an unexpected result type '%s' - ignoring!"
+                % type(find_query_options).__name__
+            )
+            find_query_options = None
+
+        if not find_query_options:
+            find_query_options = {
+                'filters': publish_filters,
+                'fields': fields
+            }
+
         # load the data into the publish model:
-        search.publish_model.load_data(filters=publish_filters, fields=fields)
+        self._app.log_info('Loading data with args: {0}'.format(find_query_options))
+        search.publish_model.load_data(**find_query_options)
+
+        self._app.log_info('Start load cached publishes')
+
         return copy.deepcopy(search.publish_model.get_sg_data())
 
     def _task_filter_publishes(self, sg_publishes, environment, **kwargs):
         """
         """
+
+        self._app.log_info('Start task filter publishes')
+
         # time.sleep(5)
         filtered_publishes = []
         if (
@@ -1099,6 +1257,9 @@ class AsyncFileFinder(FileFinder):
                 environment.publish_template,
                 environment.valid_file_extensions,
             )
+        
+        self._app.log_info('End task filter publishes')
+
         return {"sg_publishes": filtered_publishes}
 
     def _task_process_publish_items(
@@ -1129,6 +1290,9 @@ class AsyncFileFinder(FileFinder):
         """
         """
         work_files = []
+        self._app.log_info(
+            'Looking for task work file paths for environment: {0}'.format(environment)
+        )
         if environment and environment.context and environment.work_template:
             work_files = self._find_work_files(
                 environment.context,
