@@ -349,7 +349,7 @@ class FileFinder(QtCore.QObject):
 
     def _retrieve_context_template_fields(self, context, template,validate=False):
 
-        thread_lock.acquire()
+        #thread_lock.acquire()
         self._app.log_info(
             (
                 'Context as template fields\n'
@@ -371,7 +371,7 @@ class FileFinder(QtCore.QObject):
 
         timing = time.time() - start
         self._app.log_info('Resolved fields took: {0}s'.format(timing))
-        thread_lock.release()
+        #thread_lock.release()
 
         return fields
 
