@@ -151,8 +151,14 @@ class FileFormBase(QtGui.QWidget):
 
         # get any extra display fields we'll need to retrieve:
         extra_display_fields = app.get_setting("my_tasks_extra_display_fields")
-        # get the my task filters from the config.
-        my_tasks_filters = app.get_setting("my_tasks_filters")
+        # # get the my task filters from the config.
+        # my_tasks_filters = app.get_setting("my_tasks_filters")
+
+        # filter users assigned to the task, using the filter_users hook and using the
+        # current project backend login
+        my_tasks_filters = app.execute_hook_method(
+            "hook_filter_current_sg_user_tasks", "get_my_tasks_filters"
+        )
 
         # create the model:
         model = MyTasksModel(

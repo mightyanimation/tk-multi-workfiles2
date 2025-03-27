@@ -125,6 +125,11 @@ configuration:
         description: Contains methods to retrieve custom user login and push user data when a
                      work file is saved.
 
+    hook_filter_current_sg_user_tasks:
+        type: hook
+        default_value: "{self}/filter_current_sg_user_tasks.py"
+        description: Specify a hook that filters users based on the current project backend.
+
     # General preferences
     #
     entities:
@@ -212,7 +217,8 @@ configuration:
         type: shotgun_filter
       allows_empty: True
       default_value:
-        - [task_assignees, is, '{context.user}']
+      #  - [task_assignees, is, '{context.user}']
+        - [id, is_not, None]  # Dummy filter, check filter_current_sg_user_tasks.py hook for details
 
     file_extensions:
         type: list
